@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use blew::{DeviceId, L2capChannel};
+use iroh_base::EndpointId;
 use bytes::Bytes;
 
 use crate::error::BleResult;
@@ -19,6 +20,9 @@ pub trait BleInterface: Send + Sync + 'static {
     /// if the peer does not publish VERSION (older build or characteristic
     /// absent); callers treat that as "skip the check".
     async fn read_version(&self, device_id: &DeviceId) -> BleResult<Option<u8>>;
+    /// Read the peer's 32-byte IDENTITY characteristic. Returns `Ok(None)` if the
+    /// peer does not publish it, or publishes something the wrong length.
+    async fn read_identity(&self, device_id: &DeviceId) -> BleResult<Option<EndpointId>>;
     async fn open_l2cap(&self, device_id: &DeviceId, psm: u16) -> BleResult<L2capChannel>;
     async fn start_scan(&self) -> BleResult<()>;
     async fn stop_scan(&self) -> BleResult<()>;
@@ -65,6 +69,9 @@ mod tests {
             Ok(None)
         }
         async fn read_version(&self, _: &DeviceId) -> BleResult<Option<u8>> {
+            Ok(None)
+        }
+        async fn read_identity(&self, _: &DeviceId) -> BleResult<Option<EndpointId>> {
             Ok(None)
         }
         async fn open_l2cap(&self, _: &DeviceId, _: u16) -> BleResult<L2capChannel> {

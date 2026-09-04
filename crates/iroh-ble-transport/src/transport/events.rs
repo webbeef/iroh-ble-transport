@@ -191,6 +191,7 @@ pub async fn run_peripheral_requests(
     peripheral: Arc<Peripheral>,
     inbox: mpsc::Sender<PeerCommand>,
     psm: Arc<AtomicU16>,
+    local_id: iroh_base::EndpointId,
 ) {
     use tokio_stream::StreamExt as _;
     let Some(mut requests) = peripheral.take_requests() else {
@@ -233,6 +234,8 @@ pub async fn run_peripheral_requests(
                     }
                 } else if char_uuid == crate::transport::transport::IROH_VERSION_CHAR_UUID {
                     responder.respond(vec![crate::transport::transport::PROTOCOL_VERSION]);
+                } else if char_uuid == crate::transport::transport::IROH_IDENTITY_CHAR_UUID {
+                    responder.respond(local_id.as_bytes().to_vec());
                 } else {
                     responder.respond(Vec::new());
                 }
