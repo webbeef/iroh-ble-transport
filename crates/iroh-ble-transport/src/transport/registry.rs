@@ -6668,6 +6668,12 @@ mod tests {
             async fn read_version(&self, _: &DeviceId) -> crate::error::BleResult<Option<u8>> {
                 Ok(None)
             }
+            async fn read_identity(
+                &self,
+                _: &DeviceId,
+            ) -> crate::error::BleResult<Option<iroh_base::EndpointId>> {
+                Ok(None)
+            }
             async fn open_l2cap(
                 &self,
                 _: &DeviceId,

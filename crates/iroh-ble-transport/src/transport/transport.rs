@@ -46,6 +46,15 @@ const IROH_C2P_CHAR_UUID: Uuid = uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2");
 const IROH_P2C_CHAR_UUID: Uuid = uuid!("69726f03-8e45-4c2c-b3a5-331f3098b5c2");
 pub(crate) const IROH_PSM_CHAR_UUID: Uuid = uuid!("69726f04-8e45-4c2c-b3a5-331f3098b5c2");
 pub(crate) const IROH_VERSION_CHAR_UUID: Uuid = uuid!("69726f05-8e45-4c2c-b3a5-331f3098b5c2");
+/// Read-only, returns the peripheral's 32-byte `EndpointId`.
+///
+/// An advertisement only carries the first [`KEY_PREFIX_LEN`] bytes of the key, which
+/// is enough to recognise a peer you already know but not enough to dial one you do
+/// not: every dial path needs a full `EndpointId`. Without this, discovery can only
+/// ever reconnect peers whose id arrived out of band. Reading it costs a GATT
+/// connection and no pairing or bonding.
+pub(crate) const IROH_IDENTITY_CHAR_UUID: Uuid =
+    uuid!("69726f06-8e45-4c2c-b3a5-331f3098b5c2");
 
 /// On-wire protocol version served by the peripheral on the VERSION
 /// characteristic and verified by the central immediately after connect.
@@ -204,7 +213,7 @@ fn iroh_key_uuid(endpoint_id: &EndpointId) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-fn build_gatt_services(key_uuid: Uuid) -> Vec<GattService> {
+fn build_gatt_services(key_uuid: Uuid, local_id: &EndpointId) -> Vec<GattService> {
     let characteristics = vec![
         GattCharacteristic {
             uuid: IROH_C2P_CHAR_UUID,
@@ -234,6 +243,13 @@ fn build_gatt_services(key_uuid: Uuid) -> Vec<GattService> {
             properties: CharacteristicProperties::READ,
             permissions: AttributePermissions::READ,
             value: vec![],
+            descriptors: vec![],
+        },
+        GattCharacteristic {
+            uuid: IROH_IDENTITY_CHAR_UUID,
+            properties: CharacteristicProperties::READ,
+            permissions: AttributePermissions::READ,
+            value: local_id.as_bytes().to_vec(),
             descriptors: vec![],
         },
     ];
@@ -304,6 +320,10 @@ pub struct BleTransport {
     /// `AtomicWaker` (which would clobber prior registrations and leak wakeups).
     inbox_capacity_wakers: Arc<Mutex<Vec<Waker>>>,
     store: Arc<dyn PeerStore>,
+    /// Kept so `read_identity` can issue a one-off GATT read. Deliberately not
+    /// routed through the registry actor: reading an identity touches no peer
+    /// state, and a scanned device has no registry entry yet.
+    iface: Arc<dyn crate::transport::interface::BleInterface>,
 }
 
 impl std::fmt::Debug for BleTransport {
@@ -494,7 +514,7 @@ impl BleTransport {
             .map_err(adapter_wait_error)?;
 
         let key_uuid = iroh_key_uuid(&local_id);
-        let services = build_gatt_services(key_uuid);
+        let services = build_gatt_services(key_uuid, &local_id);
         construct_step(
             "register_gatt_services",
             register_gatt_services(&peripheral, &services),
@@ -555,6 +575,8 @@ impl BleTransport {
         ));
         let routing = Arc::new(crate::transport::routing::Routing::new());
         let connections = Arc::new(crate::transport::conns::ConnectionRegistry::default());
+        let iface_for_reads: Arc<dyn crate::transport::interface::BleInterface> =
+            Arc::clone(&iface) as _;
         let driver = Driver::new(
             iface,
             inbox_tx.clone(),
@@ -633,11 +655,13 @@ impl BleTransport {
             Arc::clone(&peripheral),
             inbox_tx.clone(),
             psm_atomic,
+            local_id,
         ));
         tokio::spawn(run_watchdog(inbox_tx.clone()));
 
         Ok(Arc::new(Self {
             local_id,
+            iface: iface_for_reads,
             hook_tx,
             handle: RegistryHandle {
                 inbox: inbox_tx,
@@ -736,6 +760,23 @@ impl BleTransport {
     pub fn has_scan_hint_for_endpoint(&self, endpoint_id: &EndpointId) -> bool {
         let prefix = crate::transport::routing::prefix_from_endpoint(endpoint_id);
         self.routing.scan_hint_for_prefix(&prefix).is_some()
+    }
+
+    /// Read a scanned peripheral's `EndpointId` over GATT.
+    ///
+    /// Turns an advertisement — which only carries a key prefix — into an identity
+    /// that can actually be dialled, so an application can offer to connect to a peer
+    /// it has never seen before. No pairing or bonding is involved; this is a plain
+    /// characteristic read.
+    ///
+    /// Returns `Ok(None)` for a peer that does not publish the characteristic, which
+    /// is how a peer running an older version presents.
+    ///
+    /// # Errors
+    ///
+    /// Propagates GATT failures, including being unable to reach the device.
+    pub async fn read_identity(&self, device_id: &blew::DeviceId) -> BleResult<Option<EndpointId>> {
+        self.iface.read_identity(device_id).await
     }
 
     /// Public-facing peer snapshot. Filters out `Unknown` (pre-state internal

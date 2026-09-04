@@ -819,6 +819,7 @@ const C2P_CHAR_UUID: Uuid = uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2");
 const P2C_CHAR_UUID: Uuid = uuid!("69726f03-8e45-4c2c-b3a5-331f3098b5c2");
 const PSM_CHAR_UUID: Uuid = uuid!("69726f04-8e45-4c2c-b3a5-331f3098b5c2");
 const VERSION_CHAR_UUID: Uuid = uuid!("69726f05-8e45-4c2c-b3a5-331f3098b5c2");
+const IDENTITY_CHAR_UUID: Uuid = uuid!("69726f06-8e45-4c2c-b3a5-331f3098b5c2");
 
 pub struct BlewDriver {
     central: Arc<Central>,
@@ -948,6 +949,24 @@ impl BleInterface for BlewDriver {
             return Ok(None);
         }
         Ok(Some(u16::from_le_bytes([bytes[0], bytes[1]])))
+    }
+
+    async fn read_identity(
+        &self,
+        device_id: &blew::DeviceId,
+    ) -> crate::error::BleResult<Option<iroh_base::EndpointId>> {
+        let bytes = self
+            .central
+            .read_characteristic(device_id, IDENTITY_CHAR_UUID)
+            .await?;
+        // A peer without the characteristic answers empty; anything that is not
+        // exactly a key is a peer we cannot dial, so treat both as "no identity"
+        // rather than surfacing an error the caller can do nothing with.
+        let Ok(key): Result<[u8; 32], _> = bytes.as_slice().try_into() else {
+            tracing::debug!(device = %device_id, len = bytes.len(), "no usable IDENTITY");
+            return Ok(None);
+        };
+        Ok(iroh_base::EndpointId::from_bytes(&key).ok())
     }
 
     async fn read_version(
