@@ -224,14 +224,8 @@ dependencies = [
 
 [[package]]
 name = "blew"
-<<<<<<< HEAD
-version = "0.4.0-beta.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39b4cc1b4f45c090b1d3e2aef43fc9156227b4fab38512941f8c6401f1d4ab46"
-=======
 version = "0.4.0-beta.1"
 source = "git+https://github.com/webbeef/blew.git?branch=beaver#cbdf6ceb303e9b7c5c24f3ac78fe89c19dfe5520"
->>>>>>> fd81b70 (build: depend on blew beaver fork)
 dependencies = [
  "bitflags",
  "bluer",
