@@ -975,13 +975,29 @@ impl BleInterface for BlewDriver {
         &self,
         device_id: &blew::DeviceId,
     ) -> crate::error::BleResult<Option<iroh_base::EndpointId>> {
-        let bytes = self
-            .central
-            .read_characteristic(device_id, IDENTITY_CHAR_UUID)
-            .await?;
-        // A peer without the characteristic answers empty; anything that is not
-        // exactly a key is a peer we cannot dial, so treat both as "no identity"
-        // rather than surfacing an error the caller can do nothing with.
+        // A sighting is only an advertisement. The peer has never been connected and
+        // its attribute tree does not exist yet, so reading straight away fails with
+        // `CharacteristicNotFound` -- the peripheral is in the central's map from
+        // discovery, but it has no services on it.
+        self.central.connect(device_id).await?;
+        let read = async {
+            self.central.discover_services(device_id).await?;
+            self.central
+                .read_characteristic(device_id, IDENTITY_CHAR_UUID)
+                .await
+        }
+        .await;
+        // Released on the error path too: this is a drive-by read, not a session, and
+        // an open link would block the transport's own connect to the same peer.
+        if let Err(e) = self.central.disconnect(device_id).await {
+            tracing::debug!(device = %device_id, ?e, "identity read: disconnect failed");
+        }
+        let bytes = read?;
+        // An older peer that does publish the characteristic answers empty; anything
+        // that is not exactly a key is a peer we cannot dial. Treat both as "no
+        // identity" rather than surfacing an error the caller can do nothing with.
+        // Note a peer with no characteristic at all errors above instead.
+
         let Ok(key): Result<[u8; 32], _> = bytes.as_slice().try_into() else {
             tracing::debug!(device = %device_id, len = bytes.len(), "no usable IDENTITY");
             return Ok(None);
