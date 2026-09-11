@@ -23,7 +23,13 @@ pub trait BleInterface: Send + Sync + 'static {
     /// Read what the peer publishes about itself -- its 32-byte IDENTITY and its NAME
     /// -- on a single connection. Returns `Ok(None)` if IDENTITY is not a 32-byte key,
     /// which is a peer we could not dial anyway.
-    async fn read_identity(&self, device_id: &DeviceId) -> BleResult<Option<PeerIdentity>>;
+    ///
+    /// Defaulted so adding it did not break downstream implementors: a backend that
+    /// does not serve IDENTITY reports no peer, exactly as one that serves a malformed
+    /// key does.
+    async fn read_identity(&self, _device_id: &DeviceId) -> BleResult<Option<PeerIdentity>> {
+        Ok(None)
+    }
     async fn open_l2cap(&self, device_id: &DeviceId, psm: u16) -> BleResult<L2capChannel>;
     async fn start_scan(&self) -> BleResult<()>;
     async fn stop_scan(&self) -> BleResult<()>;
@@ -67,9 +73,6 @@ mod tests {
             Ok(None)
         }
         async fn read_version(&self, _: &DeviceId) -> BleResult<Option<u8>> {
-            Ok(None)
-        }
-        async fn read_identity(&self, _: &DeviceId) -> BleResult<Option<PeerIdentity>> {
             Ok(None)
         }
         async fn open_l2cap(&self, _: &DeviceId, _: u16) -> BleResult<L2capChannel> {

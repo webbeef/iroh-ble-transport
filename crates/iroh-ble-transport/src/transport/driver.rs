@@ -819,8 +819,7 @@ const C2P_CHAR_UUID: Uuid = uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2");
 const P2C_CHAR_UUID: Uuid = uuid!("69726f03-8e45-4c2c-b3a5-331f3098b5c2");
 const PSM_CHAR_UUID: Uuid = uuid!("69726f04-8e45-4c2c-b3a5-331f3098b5c2");
 const VERSION_CHAR_UUID: Uuid = uuid!("69726f05-8e45-4c2c-b3a5-331f3098b5c2");
-const IDENTITY_CHAR_UUID: Uuid = uuid!("69726f06-8e45-4c2c-b3a5-331f3098b5c2");
-const NAME_CHAR_UUID: Uuid = uuid!("69726f07-8e45-4c2c-b3a5-331f3098b5c2");
+use crate::transport::transport::{IROH_IDENTITY_CHAR_UUID, IROH_NAME_CHAR_UUID};
 
 pub struct BlewDriver {
     central: Arc<Central>,
@@ -840,6 +839,25 @@ pub struct BlewDriver {
 }
 
 impl BlewDriver {
+    /// The IDENTITY and NAME reads, both on the one connection: the connect is the
+    /// expensive part, and it stops the peer advertising, so a second one would
+    /// silence it twice over.
+    async fn read_identity_chars(
+        &self,
+        device_id: &blew::DeviceId,
+    ) -> crate::error::BleResult<(Vec<u8>, Vec<u8>)> {
+        self.central.discover_services(device_id).await?;
+        let identity = self
+            .central
+            .read_characteristic(device_id, IROH_IDENTITY_CHAR_UUID)
+            .await?;
+        let name = self
+            .central
+            .read_characteristic(device_id, IROH_NAME_CHAR_UUID)
+            .await?;
+        Ok((identity, name))
+    }
+
     pub fn new(
         central: Arc<Central>,
         peripheral: Arc<Peripheral>,
@@ -956,47 +974,46 @@ impl BleInterface for BlewDriver {
         &self,
         device_id: &blew::DeviceId,
     ) -> crate::error::BleResult<Option<crate::transport::PeerIdentity>> {
-        // A sighting is only an advertisement. The peer has never been connected and
-        // its attribute tree does not exist yet, so reading straight away fails with
-        // `CharacteristicNotFound` -- the peripheral is in the central's map from
-        // discovery, but it has no services on it.
-        self.central.connect(device_id).await?;
-        let read: Result<(Vec<u8>, Vec<u8>), blew::BlewError> = async {
-            self.central.discover_services(device_id).await?;
-            // Both on the one connection: the connect is the expensive part, and it
-            // stops the peer advertising, so a second one would silence it twice over.
-            let identity = self
-                .central
-                .read_characteristic(device_id, IDENTITY_CHAR_UUID)
-                .await?;
-            let name = self
-                .central
-                .read_characteristic(device_id, NAME_CHAR_UUID)
-                .await?;
-            Ok((identity, name))
+        // Reuse a link the driver already holds rather than opening a second one. On a
+        // shared `Central` a redundant connect is not just slow: the disconnect below
+        // would tear down the transport's own pipe, forcing a re-dial and blacking the
+        // peer out of discovery for as long as it takes to resume advertising.
+        let linked = self
+            .channels_by_device
+            .lock()
+            .expect("channels_by_device mutex poisoned")
+            .contains_key(device_id);
+
+        if !linked {
+            // A sighting is only an advertisement. The peer has never been connected
+            // and its attribute tree does not exist yet, so reading straight away
+            // fails with `CharacteristicNotFound` -- the peripheral is in the central's
+            // map from discovery, but it has no services on it.
+            self.central.connect(device_id).await?;
         }
-        .await;
-        // Released on the error path too: this is a drive-by read, not a session, and
-        // an open link would block the transport's own connect to the same peer.
-        if let Err(e) = self.central.disconnect(device_id).await {
-            tracing::debug!(device = %device_id, ?e, "identity read: disconnect failed");
+        let read = self.read_identity_chars(device_id).await;
+        if !linked {
+            // Released on the error path too: this is a drive-by read, not a session,
+            // and an open link would block the transport's own connect to this peer.
+            if let Err(e) = self.central.disconnect(device_id).await {
+                tracing::debug!(device = %device_id, ?e, "identity read: disconnect failed");
+            }
         }
         let (bytes, name) = read?;
         // Lossy rather than fallible: a name that is not valid UTF-8 is a display
         // problem, and no reason to refuse a peer we can otherwise dial.
         let name = String::from_utf8_lossy(&name).into_owned();
-        // An older peer that does publish the characteristic answers empty; anything
-        // that is not exactly a key is a peer we cannot dial. Treat both as "no
-        // identity" rather than surfacing an error the caller can do nothing with.
-        // Note a peer with no characteristic at all errors above instead.
-
-        let Ok(key): Result<[u8; 32], _> = bytes.as_slice().try_into() else {
+        // Anything that is not exactly a key is a peer we cannot dial, so report it as
+        // "no identity" rather than an error the caller can do nothing with. A peer
+        // serving no IDENTITY characteristic at all errors out of the read instead.
+        let endpoint_id = <&[u8; 32]>::try_from(bytes.as_slice())
+            .ok()
+            .and_then(|key| iroh_base::EndpointId::from_bytes(key).ok());
+        let Some(endpoint_id) = endpoint_id else {
             tracing::debug!(device = %device_id, len = bytes.len(), "no usable IDENTITY");
             return Ok(None);
         };
-        Ok(iroh_base::EndpointId::from_bytes(&key)
-            .ok()
-            .map(|endpoint_id| crate::transport::PeerIdentity { endpoint_id, name }))
+        Ok(Some(crate::transport::PeerIdentity { endpoint_id, name }))
     }
 
     async fn read_version(

@@ -57,24 +57,20 @@ pub(crate) const IROH_IDENTITY_CHAR_UUID: Uuid = uuid!("69726f06-8e45-4c2c-b3a5-
 
 /// The peer's chosen display name, UTF-8, served over GATT.
 ///
-/// Separate from the advertised local name, which cannot be relied on to arrive: it
-/// competes for a 31-byte advertising budget with the 128-bit service UUID, and a
-/// central may report the peer's operating-system name in its place. BlueZ does
-/// exactly that for a dual-mode peer, preferring its Classic EIR name.
+/// The same name the advertisement carries, served where it can be read reliably: in
+/// an advertisement it competes for a 31-byte budget with the 128-bit service UUID,
+/// and a central may report the peer's operating-system name in its place -- BlueZ
+/// does exactly that for a dual-mode peer, preferring its Classic EIR name.
 ///
 /// Every peer publishes it, so a central can treat it as required.
 pub(crate) const IROH_NAME_CHAR_UUID: Uuid = uuid!("69726f07-8e45-4c2c-b3a5-331f3098b5c2");
 
 /// What a peer publishes about itself over GATT, read on a single connection.
-///
-/// Both values come from one connect: the connect is the expensive part of the
-/// exchange, and it makes the peer stop advertising, so a second one would silence it
-/// twice over for one string.
 #[derive(Clone, Debug)]
 pub struct PeerIdentity {
     /// The peer's full public key, which an advertisement cannot carry.
     pub endpoint_id: EndpointId,
-    /// The peer's chosen display name.
+    /// The peer's chosen display name -- the same one it advertises.
     pub name: String,
 }
 
@@ -235,6 +231,20 @@ fn iroh_key_uuid(endpoint_id: &EndpointId) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+/// A characteristic a central may read and nobody may write.
+///
+/// A non-empty `value` is served by the backend itself, without reaching the
+/// peripheral request pump; an empty one leaves the pump to answer.
+fn read_only_char(uuid: Uuid, value: Vec<u8>) -> GattCharacteristic {
+    GattCharacteristic {
+        uuid,
+        properties: CharacteristicProperties::READ,
+        permissions: AttributePermissions::READ,
+        value,
+        descriptors: vec![],
+    }
+}
+
 fn build_gatt_services(
     key_uuid: Uuid,
     local_id: &EndpointId,
@@ -257,34 +267,12 @@ fn build_gatt_services(
             value: vec![],
             descriptors: vec![],
         },
-        GattCharacteristic {
-            uuid: IROH_VERSION_CHAR_UUID,
-            properties: CharacteristicProperties::READ,
-            permissions: AttributePermissions::READ,
-            value: vec![PROTOCOL_VERSION],
-            descriptors: vec![],
-        },
-        GattCharacteristic {
-            uuid: IROH_PSM_CHAR_UUID,
-            properties: CharacteristicProperties::READ,
-            permissions: AttributePermissions::READ,
-            value: vec![],
-            descriptors: vec![],
-        },
-        GattCharacteristic {
-            uuid: IROH_IDENTITY_CHAR_UUID,
-            properties: CharacteristicProperties::READ,
-            permissions: AttributePermissions::READ,
-            value: local_id.as_bytes().to_vec(),
-            descriptors: vec![],
-        },
-        GattCharacteristic {
-            uuid: IROH_NAME_CHAR_UUID,
-            properties: CharacteristicProperties::READ,
-            permissions: AttributePermissions::READ,
-            value: local_name.as_bytes().to_vec(),
-            descriptors: vec![],
-        },
+        read_only_char(IROH_VERSION_CHAR_UUID, vec![PROTOCOL_VERSION]),
+        // Empty: the PSM is not known until the L2CAP listener is up, so this one is
+        // answered dynamically by the peripheral request pump.
+        read_only_char(IROH_PSM_CHAR_UUID, vec![]),
+        read_only_char(IROH_IDENTITY_CHAR_UUID, local_id.as_bytes().to_vec()),
+        read_only_char(IROH_NAME_CHAR_UUID, local_name.as_bytes().to_vec()),
     ];
     vec![
         GattService {
@@ -353,9 +341,16 @@ pub struct BleTransport {
     /// `AtomicWaker` (which would clobber prior registrations and leak wakeups).
     inbox_capacity_wakers: Arc<Mutex<Vec<Waker>>>,
     store: Arc<dyn PeerStore>,
-    /// Kept so `read_identity` can issue a one-off GATT read. Deliberately not
-    /// routed through the registry actor: reading an identity touches no peer
-    /// state, and a scanned device has no registry entry yet.
+    /// Kept so `read_identity` can issue a one-off GATT read.
+    ///
+    /// This bypasses the driver's per-device lane, which serialises connect,
+    /// disconnect, refresh, the VERSION read and the L2CAP open so a teardown always
+    /// finishes before the retry that reuses the same native connection begins. An
+    /// identity read is the only native-connection work not on that lane, so it races
+    /// them; `read_identity` reuses an existing link where there is one, which covers
+    /// the case that actually bit. Routing it through the registry as a
+    /// `PeerAction`/reply pair would remove the race, and needs a request/response
+    /// seam no `PeerCommand` has today.
     iface: Arc<dyn crate::transport::interface::BleInterface>,
 }
 
@@ -691,7 +686,6 @@ impl BleTransport {
             Arc::clone(&peripheral),
             inbox_tx.clone(),
             psm_atomic,
-            local_id,
         ));
         tokio::spawn(run_watchdog(inbox_tx.clone()));
 
@@ -805,8 +799,7 @@ impl BleTransport {
     /// it has never seen before. No pairing or bonding is involved; this is a plain
     /// characteristic read.
     ///
-    /// Returns `Ok(None)` for a peer that does not publish the characteristic, which
-    /// is how a peer running an older version presents.
+    /// Returns `Ok(None)` when IDENTITY is not a 32-byte key.
     ///
     /// # Errors
     ///

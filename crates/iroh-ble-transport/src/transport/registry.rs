@@ -1202,23 +1202,37 @@ impl Registry {
             }
             return;
         }
-        let channel = match &entry.phase {
-            PeerPhase::Connected { channel, .. } | PeerPhase::Handshaking { channel, .. } => {
-                Some(channel.clone())
-            }
-            _ => None,
+        // Only these two phases hold a pipe, so only they have anything to drain.
+        //
+        // The `Central` is shared: blew reports every link drop on it, including one
+        // for a connection another consumer of the adapter opened. Draining on such a
+        // drop takes a peer we are merely tracking from `Discovered` to `Draining`,
+        // and the tick then tombstones it `Dead { Drained }`, rejecting every
+        // datagram -- recoverable only on its next advertisement, which connecting to
+        // a peripheral is precisely what suppresses. `CentralConnected` is ignored for
+        // the same reason; this is the other half of that.
+        let (PeerPhase::Connected { channel, .. } | PeerPhase::Handshaking { channel, .. }) =
+            &entry.phase
+        else {
+            tracing::trace!(
+                device = %device_id,
+                phase = ?PhaseKind::from(&entry.phase),
+                ?reason,
+                "ignoring disconnect: no pipe of ours on this peer"
+            );
+            return;
         };
+        // Ends the borrow, so `entry` can be borrowed mutably below.
+        let channel = channel.clone();
         let broken_pipe_acks =
             Self::drain_to_draining(&mut self.next_lifecycle, entry, now, reason.clone());
         actions.extend(broken_pipe_acks);
-        if let Some(ch) = channel {
-            actions.push(PeerAction::CloseChannel {
-                lifecycle_id,
-                device_id: device_id.clone(),
-                channel: ch,
-                reason: reason.clone(),
-            });
-        }
+        actions.push(PeerAction::CloseChannel {
+            lifecycle_id,
+            device_id: device_id.clone(),
+            channel,
+            reason: reason.clone(),
+        });
         if matches!(reason, crate::transport::peer::DisconnectReason::Gatt133) {
             actions.push(PeerAction::Refresh {
                 lifecycle_id,
@@ -4191,6 +4205,37 @@ mod tests {
     }
 
     #[test]
+    fn foreign_disconnect_leaves_a_peer_we_hold_no_pipe_for_alone() {
+        // See `handle_central_disconnected`: blew reports another adapter consumer's
+        // link drop to us just like our own, and draining on it would tombstone a peer
+        // we can still dial.
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-foreign-disconnect");
+        advertise(&mut reg, &device_id, [7u8; 12]);
+
+        let actions = reg.handle(PeerCommand::CentralDisconnected {
+            device_id: device_id.clone(),
+            // What blew reports when another consumer of the adapter calls
+            // `disconnect()`, which is how the identity read surfaces.
+            cause: blew::DisconnectCause::LocalClose,
+        });
+
+        assert!(
+            matches!(
+                reg.peer(&device_id).unwrap().phase,
+                PeerPhase::Discovered { .. }
+            ),
+            "a disconnect for a peer we hold no pipe for must not drain it"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::CloseChannel { .. })),
+            "there is no channel of ours to close"
+        );
+    }
+
+    #[test]
     fn resumable_drain_returns_to_discovered_instead_of_dead() {
         let mut reg = Registry::new_for_test();
         let device_id = blew::DeviceId::from("dev-resume-tick");
@@ -6666,12 +6711,6 @@ mod tests {
                 Ok(None)
             }
             async fn read_version(&self, _: &DeviceId) -> crate::error::BleResult<Option<u8>> {
-                Ok(None)
-            }
-            async fn read_identity(
-                &self,
-                _: &DeviceId,
-            ) -> crate::error::BleResult<Option<crate::transport::PeerIdentity>> {
                 Ok(None)
             }
             async fn open_l2cap(
