@@ -53,8 +53,30 @@ pub(crate) const IROH_VERSION_CHAR_UUID: Uuid = uuid!("69726f05-8e45-4c2c-b3a5-3
 /// not: every dial path needs a full `EndpointId`. Without this, discovery can only
 /// ever reconnect peers whose id arrived out of band. Reading it costs a GATT
 /// connection and no pairing or bonding.
-pub(crate) const IROH_IDENTITY_CHAR_UUID: Uuid =
-    uuid!("69726f06-8e45-4c2c-b3a5-331f3098b5c2");
+pub(crate) const IROH_IDENTITY_CHAR_UUID: Uuid = uuid!("69726f06-8e45-4c2c-b3a5-331f3098b5c2");
+
+/// The peer's chosen display name, UTF-8, served over GATT.
+///
+/// Separate from the advertised local name, which cannot be relied on to arrive: it
+/// competes for a 31-byte advertising budget with the 128-bit service UUID, and a
+/// central may report the peer's operating-system name in its place. BlueZ does
+/// exactly that for a dual-mode peer, preferring its Classic EIR name.
+///
+/// Every peer publishes it, so a central can treat it as required.
+pub(crate) const IROH_NAME_CHAR_UUID: Uuid = uuid!("69726f07-8e45-4c2c-b3a5-331f3098b5c2");
+
+/// What a peer publishes about itself over GATT, read on a single connection.
+///
+/// Both values come from one connect: the connect is the expensive part of the
+/// exchange, and it makes the peer stop advertising, so a second one would silence it
+/// twice over for one string.
+#[derive(Clone, Debug)]
+pub struct PeerIdentity {
+    /// The peer's full public key, which an advertisement cannot carry.
+    pub endpoint_id: EndpointId,
+    /// The peer's chosen display name.
+    pub name: String,
+}
 
 /// On-wire protocol version served by the peripheral on the VERSION
 /// characteristic and verified by the central immediately after connect.
@@ -63,6 +85,10 @@ pub(crate) const IROH_IDENTITY_CHAR_UUID: Uuid =
 pub const PROTOCOL_VERSION: u8 = 1;
 
 const KEY_UUID_PREFIX: [u8; 4] = [0x69, 0x72, 0x6f, 0x00];
+
+/// Published on the IDENTITY characteristic when the builder is given no name.
+/// Note this is *not* advertised: see [`build_gatt_services`].
+const DEFAULT_LOCAL_NAME: &str = "iroh";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum L2capPolicy {
@@ -82,11 +108,13 @@ pub enum L2capPolicy {
 /// - [`Central::new`] + [`Peripheral::new`] are constructed with
 ///   default config at `build` time
 /// - [`InMemoryPeerStore`] (non-durable across restarts)
+/// - IDENTITY name `"iroh"`
 pub struct BleTransportBuilder {
     l2cap_policy: L2capPolicy,
     central: Option<Arc<Central>>,
     peripheral: Option<Arc<Peripheral>>,
     peer_store: Option<Arc<dyn PeerStore>>,
+    local_name: Option<String>,
 }
 
 impl BleTransportBuilder {
@@ -96,6 +124,7 @@ impl BleTransportBuilder {
             central: None,
             peripheral: None,
             peer_store: None,
+            local_name: None,
         }
     }
 
@@ -137,6 +166,18 @@ impl BleTransportBuilder {
         self
     }
 
+    /// The display name published on the IDENTITY characteristic, so a peer that
+    /// reads it can label this node before any pairing. Defaults to `"iroh"`.
+    ///
+    /// Deliberately *not* put in the advertisement: the advertising bytes go to the
+    /// key-prefix service UUID, which is what discovery matches on, and on Android
+    /// naming an advertisement renames the whole adapter.
+    #[must_use]
+    pub fn local_name(mut self, name: impl Into<String>) -> Self {
+        self.local_name = Some(name.into());
+        self
+    }
+
     /// Construct the transport. `endpoint_id` is the local node's iroh
     /// `EndpointId` — the advertising-service UUID embeds its first 12
     /// bytes so peers discover each other without coordination. This
@@ -168,7 +209,15 @@ impl BleTransportBuilder {
         let store = self
             .peer_store
             .unwrap_or_else(|| Arc::new(InMemoryPeerStore::new()));
-        BleTransport::construct(endpoint_id, central, peripheral, store, self.l2cap_policy).await
+        BleTransport::construct(
+            endpoint_id,
+            central,
+            peripheral,
+            store,
+            self.l2cap_policy,
+            self.local_name,
+        )
+        .await
     }
 }
 
@@ -191,7 +240,11 @@ fn iroh_key_uuid(endpoint_id: &EndpointId) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-fn build_gatt_services(key_uuid: Uuid, local_id: &EndpointId) -> Vec<GattService> {
+fn build_gatt_services(
+    key_uuid: Uuid,
+    local_id: &EndpointId,
+    local_name: &str,
+) -> Vec<GattService> {
     let characteristics = vec![
         GattCharacteristic {
             uuid: IROH_C2P_CHAR_UUID,
@@ -228,6 +281,13 @@ fn build_gatt_services(key_uuid: Uuid, local_id: &EndpointId) -> Vec<GattService
             properties: CharacteristicProperties::READ,
             permissions: AttributePermissions::READ,
             value: local_id.as_bytes().to_vec(),
+            descriptors: vec![],
+        },
+        GattCharacteristic {
+            uuid: IROH_NAME_CHAR_UUID,
+            properties: CharacteristicProperties::READ,
+            permissions: AttributePermissions::READ,
+            value: local_name.as_bytes().to_vec(),
             descriptors: vec![],
         },
     ];
@@ -455,6 +515,7 @@ impl BleTransport {
         peripheral: Arc<Peripheral>,
         store: Arc<dyn PeerStore>,
         l2cap_policy: L2capPolicy,
+        local_name: Option<String>,
     ) -> BleResult<Arc<Self>> {
         let central_for_rollback = Arc::clone(&central);
         let peripheral_for_rollback = Arc::clone(&peripheral);
@@ -465,6 +526,7 @@ impl BleTransport {
             peripheral,
             store,
             l2cap_policy,
+            local_name,
             &mut rollback,
         )
         .await
@@ -485,6 +547,7 @@ impl BleTransport {
         peripheral: Arc<Peripheral>,
         store: Arc<dyn PeerStore>,
         l2cap_policy: L2capPolicy,
+        local_name: Option<String>,
         rollback: &mut ConstructRollback,
     ) -> BleResult<Arc<Self>> {
         central
@@ -497,7 +560,8 @@ impl BleTransport {
             .map_err(adapter_wait_error)?;
 
         let key_uuid = iroh_key_uuid(&local_id);
-        let services = build_gatt_services(key_uuid, &local_id);
+        let local_name = local_name.unwrap_or_else(|| DEFAULT_LOCAL_NAME.to_string());
+        let services = build_gatt_services(key_uuid, &local_id, &local_name);
         construct_step(
             "register_gatt_services",
             register_gatt_services(&peripheral, &services),
@@ -776,7 +840,10 @@ impl BleTransport {
     /// # Errors
     ///
     /// Propagates GATT failures, including being unable to reach the device.
-    pub async fn read_identity(&self, device_id: &blew::DeviceId) -> BleResult<Option<EndpointId>> {
+    pub async fn read_identity(
+        &self,
+        device_id: &blew::DeviceId,
+    ) -> BleResult<Option<PeerIdentity>> {
         self.iface.read_identity(device_id).await
     }
 

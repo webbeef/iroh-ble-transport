@@ -16,5 +16,6 @@ pub use transport::{
     BLE_CLOSE_CODE_CONFLICT, BLE_CLOSE_CODE_RETRY, BLE_CLOSE_REASON_CONFLICT,
     BLE_CLOSE_REASON_EVICTED, BLE_CLOSE_REASON_PIPE_CLOSED, BleAdapterState, BlePeerInfo,
     BlePeerPhase, BleTransport, BleTransportBuilder, ConnectPath, InMemoryPeerStore,
-    IncomingPacket, KEY_PREFIX_LEN, KeyPrefix, L2capPolicy, PeerSnapshot, PeerStore,
+    IncomingPacket, KEY_PREFIX_LEN, KeyPrefix, L2capPolicy, PeerIdentity, PeerSnapshot,
+    PeerStore,
 };

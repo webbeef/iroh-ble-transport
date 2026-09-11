@@ -9,6 +9,7 @@ use blew::{DeviceId, L2capChannel};
 use bytes::Bytes;
 
 use crate::error::BleResult;
+use crate::transport::PeerIdentity;
 use crate::transport::interface::BleInterface;
 use crate::transport::peer::{ChannelHandle, ConnectPath};
 
@@ -313,6 +314,12 @@ impl BleInterface for MockBleInterface {
             h(device_id.clone(), bytes);
         }
         Ok(())
+    }
+
+    /// No test drives identity resolution yet, so this is a stub rather than a
+    /// queue-backed response like `read_version`.
+    async fn read_identity(&self, _device_id: &DeviceId) -> BleResult<Option<PeerIdentity>> {
+        Ok(None)
     }
 
     async fn read_version(&self, device_id: &DeviceId) -> BleResult<Option<u8>> {
