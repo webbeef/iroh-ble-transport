@@ -6671,7 +6671,7 @@ mod tests {
             async fn read_identity(
                 &self,
                 _: &DeviceId,
-            ) -> crate::error::BleResult<Option<iroh_base::EndpointId>> {
+            ) -> crate::error::BleResult<Option<crate::transport::PeerIdentity>> {
                 Ok(None)
             }
             async fn open_l2cap(

@@ -53,8 +53,30 @@ pub(crate) const IROH_VERSION_CHAR_UUID: Uuid = uuid!("69726f05-8e45-4c2c-b3a5-3
 /// not: every dial path needs a full `EndpointId`. Without this, discovery can only
 /// ever reconnect peers whose id arrived out of band. Reading it costs a GATT
 /// connection and no pairing or bonding.
-pub(crate) const IROH_IDENTITY_CHAR_UUID: Uuid =
-    uuid!("69726f06-8e45-4c2c-b3a5-331f3098b5c2");
+pub(crate) const IROH_IDENTITY_CHAR_UUID: Uuid = uuid!("69726f06-8e45-4c2c-b3a5-331f3098b5c2");
+
+/// The peer's chosen display name, UTF-8, served over GATT.
+///
+/// Separate from the advertised local name, which cannot be relied on to arrive: it
+/// competes for a 31-byte advertising budget with the 128-bit service UUID, and a
+/// central may report the peer's operating-system name in its place. BlueZ does
+/// exactly that for a dual-mode peer, preferring its Classic EIR name.
+///
+/// Every peer publishes it, so a central can treat it as required.
+pub(crate) const IROH_NAME_CHAR_UUID: Uuid = uuid!("69726f07-8e45-4c2c-b3a5-331f3098b5c2");
+
+/// What a peer publishes about itself over GATT, read on a single connection.
+///
+/// Both values come from one connect: the connect is the expensive part of the
+/// exchange, and it makes the peer stop advertising, so a second one would silence it
+/// twice over for one string.
+#[derive(Clone, Debug)]
+pub struct PeerIdentity {
+    /// The peer's full public key, which an advertisement cannot carry.
+    pub endpoint_id: EndpointId,
+    /// The peer's chosen display name.
+    pub name: String,
+}
 
 /// On-wire protocol version served by the peripheral on the VERSION
 /// characteristic and verified by the central immediately after connect.
@@ -213,7 +235,11 @@ fn iroh_key_uuid(endpoint_id: &EndpointId) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-fn build_gatt_services(key_uuid: Uuid, local_id: &EndpointId) -> Vec<GattService> {
+fn build_gatt_services(
+    key_uuid: Uuid,
+    local_id: &EndpointId,
+    local_name: &str,
+) -> Vec<GattService> {
     let characteristics = vec![
         GattCharacteristic {
             uuid: IROH_C2P_CHAR_UUID,
@@ -250,6 +276,13 @@ fn build_gatt_services(key_uuid: Uuid, local_id: &EndpointId) -> Vec<GattService
             properties: CharacteristicProperties::READ,
             permissions: AttributePermissions::READ,
             value: local_id.as_bytes().to_vec(),
+            descriptors: vec![],
+        },
+        GattCharacteristic {
+            uuid: IROH_NAME_CHAR_UUID,
+            properties: CharacteristicProperties::READ,
+            permissions: AttributePermissions::READ,
+            value: local_name.as_bytes().to_vec(),
             descriptors: vec![],
         },
     ];
@@ -514,14 +547,17 @@ impl BleTransport {
             .map_err(adapter_wait_error)?;
 
         let key_uuid = iroh_key_uuid(&local_id);
-        let services = build_gatt_services(key_uuid, &local_id);
+        // Resolved before the services are built, so the characteristic and the
+        // advertisement always publish the same name.
+        let local_name = local_name.unwrap_or_else(|| DEFAULT_LOCAL_NAME.to_string());
+        let services = build_gatt_services(key_uuid, &local_id, &local_name);
         construct_step(
             "register_gatt_services",
             register_gatt_services(&peripheral, &services),
         )
         .await?;
         let advertising_config = AdvertisingConfig {
-            local_name: local_name.unwrap_or_else(|| DEFAULT_LOCAL_NAME.to_string()),
+            local_name,
             service_uuids: vec![key_uuid],
         };
         rollback.advertising = true;
@@ -775,7 +811,10 @@ impl BleTransport {
     /// # Errors
     ///
     /// Propagates GATT failures, including being unable to reach the device.
-    pub async fn read_identity(&self, device_id: &blew::DeviceId) -> BleResult<Option<EndpointId>> {
+    pub async fn read_identity(
+        &self,
+        device_id: &blew::DeviceId,
+    ) -> BleResult<Option<PeerIdentity>> {
         self.iface.read_identity(device_id).await
     }
 
