@@ -239,8 +239,8 @@ impl Registry {
             } => {
                 self.handle_peripheral_client_unsubscribed(&mut actions, now, client_id, char_uuid);
             }
-            PeerCommand::L2capHandoverTimeout { device_id } => {
-                self.handle_l2cap_handover_timeout(&mut actions, device_id);
+            PeerCommand::L2capPathEvicted { device_id } => {
+                self.handle_l2cap_path_evicted(&mut actions, device_id);
             }
         }
         actions
@@ -1736,7 +1736,7 @@ impl Registry {
         }
     }
 
-    fn handle_l2cap_handover_timeout(
+    fn handle_l2cap_path_evicted(
         &mut self,
         _actions: &mut Vec<PeerAction>,
         device_id: DeviceId,
@@ -7749,7 +7749,7 @@ mod tests {
 
     #[test]
     fn l2cap_handover_timeout_marks_failed_and_demotes_path_telemetry() {
-        // Both-paths-alive model: `L2capHandoverTimeout` arrives when
+        // Both-paths-alive model: `L2capPathEvicted` arrives when
         // the pipe supervisor evicted its wedged L2CAP worker. GATT
         // was never torn down, so the registry's only job is
         // bookkeeping — flip the `l2cap_upgrade_failed` policy flag so
@@ -7777,13 +7777,13 @@ mod tests {
                 upgrading: true,
             };
         }
-        let actions = reg.handle(PeerCommand::L2capHandoverTimeout {
+        let actions = reg.handle(PeerCommand::L2capPathEvicted {
             device_id: dev.clone(),
         });
 
         assert!(
             actions.is_empty(),
-            "L2capHandoverTimeout is pure bookkeeping under both-paths-alive; \
+            "L2capPathEvicted is pure bookkeeping under both-paths-alive; \
              got {actions:?}"
         );
         let e = &reg.peers[&dev];

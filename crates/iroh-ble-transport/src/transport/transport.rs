@@ -46,32 +46,53 @@ const IROH_C2P_CHAR_UUID: Uuid = uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2");
 const IROH_P2C_CHAR_UUID: Uuid = uuid!("69726f03-8e45-4c2c-b3a5-331f3098b5c2");
 pub(crate) const IROH_PSM_CHAR_UUID: Uuid = uuid!("69726f04-8e45-4c2c-b3a5-331f3098b5c2");
 pub(crate) const IROH_VERSION_CHAR_UUID: Uuid = uuid!("69726f05-8e45-4c2c-b3a5-331f3098b5c2");
-/// Read-only, returns the peripheral's 32-byte `EndpointId`.
+/// Read-only, returns everything a central needs about a peer that its advertisement
+/// cannot reliably carry:
 ///
-/// An advertisement only carries the first [`KEY_PREFIX_LEN`] bytes of the key, which
-/// is enough to recognise a peer you already know but not enough to dial one you do
-/// not: every dial path needs a full `EndpointId`. Without this, discovery can only
-/// ever reconnect peers whose id arrived out of band. Reading it costs a GATT
-/// connection and no pairing or bonding.
+/// - The **key**. An advertisement carries only the first [`KEY_PREFIX_LEN`] bytes,
+///   enough to recognise a peer you already know but not enough to dial one you do
+///   not: every dial path needs a full `EndpointId`. Without this, discovery can only
+///   ever reconnect peers whose id arrived out of band.
+/// - The **name**. In an advertisement it competes for a 31-byte budget with the
+///   128-bit service UUID, and a central may report the peer's operating-system name
+///   in its place -- BlueZ does exactly that for a dual-mode peer, preferring its
+///   Classic EIR name.
+///
+/// Both in one characteristic, because the connect is what costs (seconds, and it stops
+/// the peer advertising) while a second read on an open link is nearly free. See
+/// [`encode_identity`] for the layout. Reading needs no pairing or bonding.
 pub(crate) const IROH_IDENTITY_CHAR_UUID: Uuid = uuid!("69726f06-8e45-4c2c-b3a5-331f3098b5c2");
 
-/// The peer's chosen display name, UTF-8, served over GATT.
-///
-/// The same name the advertisement carries, served where it can be read reliably: in
-/// an advertisement it competes for a 31-byte budget with the 128-bit service UUID,
-/// and a central may report the peer's operating-system name in its place -- BlueZ
-/// does exactly that for a dual-mode peer, preferring its Classic EIR name.
-///
-/// Every peer publishes it, so a central can treat it as required.
-pub(crate) const IROH_NAME_CHAR_UUID: Uuid = uuid!("69726f07-8e45-4c2c-b3a5-331f3098b5c2");
+/// Width of the key field in [`encode_identity`], from the key type itself so the
+/// framing cannot drift from what `as_bytes` produces.
+const KEY_LEN: usize = EndpointId::LENGTH;
 
-/// What a peer publishes about itself over GATT, read on a single connection.
-#[derive(Clone, Debug)]
+/// What a peer publishes about itself on [`IROH_IDENTITY_CHAR_UUID`].
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerIdentity {
     /// The peer's full public key, which an advertisement cannot carry.
     pub endpoint_id: EndpointId,
     /// The peer's chosen display name -- the same one it advertises.
     pub name: String,
+}
+
+/// Wire form of [`IROH_IDENTITY_CHAR_UUID`]: the fixed-width key, then the name, which
+/// needs no length prefix because it runs to the end of the value.
+fn encode_identity(id: &EndpointId, name: &str) -> Vec<u8> {
+    [id.as_bytes().as_slice(), name.as_bytes()].concat()
+}
+
+/// Inverse of [`encode_identity`].
+///
+/// `None` for anything not starting with a usable key: that is a peer we cannot dial,
+/// which is more useful to a caller than an error it can do nothing about.
+pub(crate) fn decode_identity(value: &[u8]) -> Option<PeerIdentity> {
+    let (key, name) = value.split_first_chunk::<KEY_LEN>()?;
+    let endpoint_id = EndpointId::from_bytes(key).ok()?;
+    // Lossy rather than fallible: a name that is not valid UTF-8 is a display problem,
+    // and no reason to refuse a peer we can otherwise dial.
+    let name = String::from_utf8_lossy(name).into_owned();
+    Some(PeerIdentity { endpoint_id, name })
 }
 
 /// On-wire protocol version served by the peripheral on the VERSION
@@ -271,8 +292,7 @@ fn build_gatt_services(
         // Empty: the PSM is not known until the L2CAP listener is up, so this one is
         // answered dynamically by the peripheral request pump.
         read_only_char(IROH_PSM_CHAR_UUID, vec![]),
-        read_only_char(IROH_IDENTITY_CHAR_UUID, local_id.as_bytes().to_vec()),
-        read_only_char(IROH_NAME_CHAR_UUID, local_name.as_bytes().to_vec()),
+        read_only_char(IROH_IDENTITY_CHAR_UUID, encode_identity(local_id, local_name)),
     ];
     vec![
         GattService {
@@ -792,14 +812,14 @@ impl BleTransport {
         self.routing.scan_hint_for_prefix(&prefix).is_some()
     }
 
-    /// Read a scanned peripheral's `EndpointId` over GATT.
+    /// Read what a scanned peripheral publishes about itself over GATT.
     ///
-    /// Turns an advertisement — which only carries a key prefix — into an identity
-    /// that can actually be dialled, so an application can offer to connect to a peer
-    /// it has never seen before. No pairing or bonding is involved; this is a plain
-    /// characteristic read.
+    /// Turns an advertisement, which only carries a key prefix and an unreliable name,
+    /// into an identity that can actually be dialled and shown, so an application can
+    /// offer to connect to a peer it has never seen before. No pairing or bonding is
+    /// involved; this is a plain characteristic read.
     ///
-    /// Returns `Ok(None)` when IDENTITY is not a 32-byte key.
+    /// Returns `Ok(None)` when the value does not start with a usable key.
     ///
     /// # Errors
     ///
@@ -835,6 +855,37 @@ impl BleTransport {
                 verified_endpoint: state.verified_endpoint,
             })
             .collect()
+    }
+
+    /// Whether this transport currently holds a data pipe to `endpoint_id`.
+    ///
+    /// Answers "is this peer still here?" for a caller whose own liveness signal is
+    /// weaker. A BLE central's only such signal is advertising, and connecting to a
+    /// peripheral is what makes it stop advertising, so a caller ageing peers out on
+    /// silence needs this to avoid dropping the very peers it is talking to.
+    ///
+    /// Only `Connected` and `Handshaking` count: a peer being dialled or retried may
+    /// equally have walked out of range, and treating those as present would stop a
+    /// caller ever expiring a peer that really left. `Handshaking` only matches once
+    /// the peer's key has been verified, so it covers a reconnect to a known peer
+    /// rather than a first-ever dial.
+    ///
+    /// The pipe-level counterpart to [`Self::has_scan_hint_for_endpoint`], which
+    /// answers the same question from the scan alone.
+    #[must_use]
+    pub fn is_endpoint_linked(&self, endpoint_id: &EndpointId) -> bool {
+        self.handle
+            .snapshots
+            .load()
+            .peer_states
+            .values()
+            .any(|state| {
+                state.verified_endpoint.as_ref() == Some(endpoint_id)
+                    && matches!(
+                        state.phase_kind,
+                        PhaseKind::Connected | PhaseKind::Handshaking
+                    )
+            })
     }
 }
 
@@ -1086,7 +1137,13 @@ impl CustomSender for BleSender {
         } else if let Some(tombstoned) = self.routing.note_tombstoned_transmit(stable_id) {
             if tombstoned.dropped_count == 1 {
                 let tombstone = &tombstoned.tombstone;
-                tracing::debug!(
+                // `info!`, not `debug!`: this is the visible symptom of a pipe torn
+                // down while something still wanted it, which is what a `PIPE_LINGER`
+                // shorter than the gap between two connections looks like from here.
+                // The transmit is then silently dropped (`Ok` below), so without this
+                // the only trace is the application's own timeout, and device builds
+                // routinely compile `debug!` out. Throttled to once per tombstone.
+                tracing::info!(
                     %stable_id,
                     device = %tombstone.device_id,
                     direction = ?tombstone.direction,
@@ -2056,5 +2113,46 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), driver_rx.recv())
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn identity_round_trips_key_and_name() {
+        let identity = PeerIdentity {
+            endpoint_id: endpoint_id_with_first_byte(7),
+            name: "Beaver Media Center".to_string(),
+        };
+        let encoded = encode_identity(&identity.endpoint_id, &identity.name);
+        assert_eq!(decode_identity(&encoded), Some(identity));
+    }
+
+    #[test]
+    fn identity_round_trips_an_empty_name() {
+        // A peer that has not been named still has to be dialable, and the value stays
+        // non-empty, which is what makes blew answer the read from the static value.
+        let identity = PeerIdentity {
+            endpoint_id: endpoint_id_with_first_byte(9),
+            name: String::new(),
+        };
+        let encoded = encode_identity(&identity.endpoint_id, &identity.name);
+        assert_eq!(encoded.len(), KEY_LEN);
+        assert_eq!(decode_identity(&encoded), Some(identity));
+    }
+
+    #[test]
+    fn identity_decodes_a_name_that_is_not_valid_utf8() {
+        // The name is whatever bytes the peer served, so decoding must not be fallible
+        // on them: a peer we can dial is worth more than a perfect name.
+        let id = endpoint_id_with_first_byte(11);
+        let mut value = encode_identity(&id, "café");
+        value.pop(); // Cuts the last codepoint in half.
+        let decoded = decode_identity(&value).unwrap();
+        assert_eq!(decoded.endpoint_id, id);
+        assert!(decoded.name.starts_with("caf"));
+    }
+
+    #[test]
+    fn identity_shorter_than_a_key_is_not_a_peer() {
+        assert_eq!(decode_identity(&[]), None);
+        assert_eq!(decode_identity(&[0u8; KEY_LEN - 1]), None);
     }
 }

@@ -476,7 +476,7 @@ async fn advertising_flood_does_not_redial_after_verified() {
 /// With L2capPolicy::PreferL2cap, a VerifiedEndpoint triggers UpgradeToL2cap.
 /// When the L2CAP channel is accepted but the peer never reads (buffer fills),
 /// the pipe supervisor evicts the wedged L2CAP worker and fires
-/// L2capHandoverTimeout. Under the both-paths-alive model this is pure
+/// L2capPathEvicted. Under the both-paths-alive model this is pure
 /// bookkeeping: the registry sets `l2cap_upgrade_failed=true` and flips the
 /// `channel.path` telemetry to Gatt while the underlying GATT worker keeps
 /// running (no pipe respawn — no RevertToGattPipe).

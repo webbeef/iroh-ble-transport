@@ -20,9 +20,9 @@ pub trait BleInterface: Send + Sync + 'static {
     /// if the peer does not publish VERSION (older build or characteristic
     /// absent); callers treat that as "skip the check".
     async fn read_version(&self, device_id: &DeviceId) -> BleResult<Option<u8>>;
-    /// Read what the peer publishes about itself -- its 32-byte IDENTITY and its NAME
-    /// -- on a single connection. Returns `Ok(None)` if IDENTITY is not a 32-byte key,
-    /// which is a peer we could not dial anyway.
+    /// Read the peer's IDENTITY characteristic: its key, then its display name.
+    /// Returns `Ok(None)` if the value does not start with a usable key, which is a
+    /// peer we could not dial anyway.
     ///
     /// Defaulted so adding it did not break downstream implementors: a backend that
     /// does not serve IDENTITY reports no peer, exactly as one that serves a malformed

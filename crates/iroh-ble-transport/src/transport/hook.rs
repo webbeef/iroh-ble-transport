@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::transport::conns::{
     BLE_CLOSE_CODE_CONFLICT, BLE_CLOSE_REASON_CONFLICT, ConnHandle, ConnectionRegistry,
-    close_evicted_pipes,
+    close_evicted_pipes, linger_then_confirm_idle,
 };
 use crate::transport::routing::parse_token_addr;
 use crate::transport::routing::{PromoteOutcome, Routing, StableConnId};
@@ -181,10 +181,14 @@ impl EndpointHooks for BleDedupHook {
             tokio::spawn(async move {
                 let _ = closed.await;
                 if connections.remove_and_is_empty(remote_endpoint, stable_id, watch_id) {
-                    let _ = tx.send(HookEvent::ConnectionClosed {
-                        endpoint_id: remote_endpoint,
-                        stable_id,
-                    });
+                    // Not torn down yet: a follow-up dial to the same peer may still be
+                    // handshaking on this pipe, and it cannot register until it lands.
+                    if linger_then_confirm_idle(&connections, remote_endpoint, stable_id).await {
+                        let _ = tx.send(HookEvent::ConnectionClosed {
+                            endpoint_id: remote_endpoint,
+                            stable_id,
+                        });
+                    }
                 }
             });
         }

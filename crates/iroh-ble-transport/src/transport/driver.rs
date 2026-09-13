@@ -819,7 +819,7 @@ const C2P_CHAR_UUID: Uuid = uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2");
 const P2C_CHAR_UUID: Uuid = uuid!("69726f03-8e45-4c2c-b3a5-331f3098b5c2");
 const PSM_CHAR_UUID: Uuid = uuid!("69726f04-8e45-4c2c-b3a5-331f3098b5c2");
 const VERSION_CHAR_UUID: Uuid = uuid!("69726f05-8e45-4c2c-b3a5-331f3098b5c2");
-use crate::transport::transport::{IROH_IDENTITY_CHAR_UUID, IROH_NAME_CHAR_UUID};
+use crate::transport::transport::{IROH_IDENTITY_CHAR_UUID, decode_identity};
 
 pub struct BlewDriver {
     central: Arc<Central>,
@@ -839,23 +839,22 @@ pub struct BlewDriver {
 }
 
 impl BlewDriver {
-    /// The IDENTITY and NAME reads, both on the one connection: the connect is the
-    /// expensive part, and it stops the peer advertising, so a second one would
-    /// silence it twice over.
-    async fn read_identity_chars(
+    /// Reads the IDENTITY value, discovering services first unless `linked` says the
+    /// driver's own `connect` already did so on this link. Split out from
+    /// `read_identity` so the caller's connect/disconnect bookkeeping wraps a failure
+    /// in either step.
+    async fn read_identity_value(
         &self,
         device_id: &blew::DeviceId,
-    ) -> crate::error::BleResult<(Vec<u8>, Vec<u8>)> {
-        self.central.discover_services(device_id).await?;
-        let identity = self
-            .central
+        linked: bool,
+    ) -> blew::error::BlewResult<Vec<u8>> {
+        if !linked {
+            // GATT attributes do not exist until services are discovered.
+            self.central.discover_services(device_id).await?;
+        }
+        self.central
             .read_characteristic(device_id, IROH_IDENTITY_CHAR_UUID)
-            .await?;
-        let name = self
-            .central
-            .read_characteristic(device_id, IROH_NAME_CHAR_UUID)
-            .await?;
-        Ok((identity, name))
+            .await
     }
 
     pub fn new(
@@ -991,7 +990,7 @@ impl BleInterface for BlewDriver {
             // map from discovery, but it has no services on it.
             self.central.connect(device_id).await?;
         }
-        let read = self.read_identity_chars(device_id).await;
+        let read = self.read_identity_value(device_id, linked).await;
         if !linked {
             // Released on the error path too: this is a drive-by read, not a session,
             // and an open link would block the transport's own connect to this peer.
@@ -999,21 +998,12 @@ impl BleInterface for BlewDriver {
                 tracing::debug!(device = %device_id, ?e, "identity read: disconnect failed");
             }
         }
-        let (bytes, name) = read?;
-        // Lossy rather than fallible: a name that is not valid UTF-8 is a display
-        // problem, and no reason to refuse a peer we can otherwise dial.
-        let name = String::from_utf8_lossy(&name).into_owned();
-        // Anything that is not exactly a key is a peer we cannot dial, so report it as
-        // "no identity" rather than an error the caller can do nothing with. A peer
-        // serving no IDENTITY characteristic at all errors out of the read instead.
-        let endpoint_id = <&[u8; 32]>::try_from(bytes.as_slice())
-            .ok()
-            .and_then(|key| iroh_base::EndpointId::from_bytes(key).ok());
-        let Some(endpoint_id) = endpoint_id else {
-            tracing::debug!(device = %device_id, len = bytes.len(), "no usable IDENTITY");
-            return Ok(None);
-        };
-        Ok(Some(crate::transport::PeerIdentity { endpoint_id, name }))
+        let value = read?;
+        let identity = decode_identity(&value);
+        if identity.is_none() {
+            tracing::debug!(device = %device_id, len = value.len(), "no usable IDENTITY");
+        }
+        Ok(identity)
     }
 
     async fn read_version(
