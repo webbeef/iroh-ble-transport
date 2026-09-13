@@ -132,7 +132,8 @@ Service: 69726f01-8e45-4c2c-b3a5-331f3098b5c2  (IROH_SERVICE_UUID)
 ├── 69726f02 — C2P    (WRITE_WITHOUT_RESPONSE | NOTIFY): central→peripheral data + ACKs
 ├── 69726f03 — P2C    (WRITE_WITHOUT_RESPONSE | NOTIFY): peripheral→central data + ACKs
 ├── 69726f04 — PSM    (READ): 2-byte LE L2CAP PSM, present only when the peripheral's `l2cap_listener()` succeeded
-└── 69726f05 — VERSION (READ): 1-byte protocol version, read by central after connect to verify wire compatibility
+├── 69726f05 — VERSION (READ): 1-byte protocol version, read by central after connect to verify wire compatibility
+└── 69726f06 — IDENTITY (READ): 32-byte `EndpointId` followed by the UTF-8 display name, so a central can dial and label a peer it has only ever seen advertise
 ```
 
 - Central writes to C2P; peripheral sends data via P2C notifications.

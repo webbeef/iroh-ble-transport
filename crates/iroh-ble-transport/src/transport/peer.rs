@@ -382,9 +382,12 @@ pub enum PeerCommand {
         client_id: DeviceId,
         char_uuid: uuid::Uuid,
     },
-    /// Emitted by the L2CAP pipe worker when its outbound write has been
-    /// blocked on backpressure for longer than L2CAP_HANDOVER_TIMEOUT.
-    L2capHandoverTimeout {
+    /// Emitted when the pipe supervisor retires the L2CAP path with GATT still
+    /// alive underneath: either its outbound write was blocked on backpressure
+    /// for longer than `L2CAP_HANDOVER_TIMEOUT`, or its io ended on its own (a
+    /// peer that resets the channel shortly after accepting it). Either way the
+    /// registry should stop proposing an upgrade this peer cannot hold.
+    L2capPathEvicted {
         device_id: DeviceId,
     },
     Shutdown,
@@ -560,7 +563,7 @@ mod tests {
             client_id: DeviceId::from("x"),
             char_uuid: uuid::Uuid::nil(),
         };
-        let _cmd4 = PeerCommand::L2capHandoverTimeout {
+        let _cmd4 = PeerCommand::L2capPathEvicted {
             device_id: DeviceId::from("x"),
         };
         let _act1 = PeerAction::UpgradeToL2cap {

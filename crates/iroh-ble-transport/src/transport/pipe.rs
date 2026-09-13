@@ -24,6 +24,16 @@
 //! swap completed (fixed the "Accepting incoming connection ended
 //! with error: timed out" failure).
 //!
+//! A worker that loses its io reports the dead path to the supervisor
+//! on `path_died_rx` and exits; it does not talk to the registry at
+//! all. Only the supervisor can see both paths, so only the
+//! supervisor can tell "a path died" from "the peer is unreachable",
+//! and it raises `StallCause::LinkDead` exactly when the last path
+//! goes. Workers used to raise that themselves, which made losing
+//! either path fatal to a pipe that still had a working one: an L2CAP
+//! upgrade that failed a few seconds in would take a healthy GATT
+//! session down with it.
+//!
 //! Supervisor exit: when `outbound_rx` closes (registry signals the
 //! pipe is done) OR both paths die, the supervisor tears down the
 //! workers and returns. `routing::evict_pipe` then fires from the
@@ -38,7 +48,6 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::{JoinError, JoinHandle};
-use tokio::time::Duration;
 
 /// Wraps a `JoinHandle` so the inner task is aborted (not just detached) when
 /// the wrapper is dropped — including when the owning task is cancelled mid
@@ -113,6 +122,37 @@ impl WorkerSet {
     fn is_empty(&self) -> bool {
         self.gatt.is_none() && self.l2cap.is_none()
     }
+
+    /// Retire one path, waiting bounded for its worker to exit. A no-op if that
+    /// path is already gone, so a worker's own death notice and an eviction from
+    /// `forward_outbound` can race without either having to check first.
+    async fn retire(&mut self, path: ConnectPath, device_id: &blew::DeviceId) {
+        match path {
+            ConnectPath::Gatt => {
+                if let Some(w) = self.gatt.take() {
+                    teardown_gatt_worker(w, device_id).await;
+                }
+            }
+            ConnectPath::L2cap => {
+                if let Some(w) = self.l2cap.take() {
+                    teardown_l2cap_worker(w, device_id).await;
+                }
+            }
+        }
+    }
+}
+
+/// Tell the registry the peer has no usable link left.
+///
+/// Only the supervisor may say this: a worker knows its own path died, not whether
+/// the other one is carrying traffic.
+async fn report_link_dead(registry_tx: &mpsc::Sender<PeerCommand>, device_id: &blew::DeviceId) {
+    let _ = registry_tx
+        .send(PeerCommand::Stalled {
+            device_id: device_id.clone(),
+            cause: crate::transport::peer::StallCause::LinkDead,
+        })
+        .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -133,6 +173,9 @@ pub async fn run_data_pipe(
     empty_frames_counter: Arc<AtomicU64>,
     last_rx_at: LivenessClock,
 ) {
+    // Depth 2, one per path: the supervisor can be parked in `forward_outbound`, and
+    // a dying worker's last act must not block on it.
+    let (path_died_tx, mut path_died_rx) = mpsc::channel::<ConnectPath>(2);
     let mut workers = match initial_path {
         ConnectPath::Gatt => WorkerSet {
             gatt: Some(spawn_gatt_worker(
@@ -141,7 +184,7 @@ pub async fn run_data_pipe(
                 stable_conn_id,
                 role,
                 incoming_tx.clone(),
-                registry_tx.clone(),
+                path_died_tx.clone(),
                 Arc::clone(&retransmit_counter),
                 Arc::clone(&truncation_counter),
                 last_rx_at.clone(),
@@ -160,7 +203,7 @@ pub async fn run_data_pipe(
                     stable_conn_id,
                     channel,
                     incoming_tx.clone(),
-                    registry_tx.clone(),
+                    path_died_tx.clone(),
                     Arc::clone(&empty_frames_counter),
                     last_rx_at.clone(),
                 )),
@@ -182,6 +225,7 @@ pub async fn run_data_pipe(
                         device = %device_id,
                         "both paths dead after outbound send; pipe exiting"
                     );
+                    report_link_dead(&registry_tx, &device_id).await;
                     break;
                 }
             }
@@ -219,7 +263,7 @@ pub async fn run_data_pipe(
                     stable_conn_id,
                     channel,
                     incoming_tx.clone(),
-                    registry_tx.clone(),
+                    path_died_tx.clone(),
                     Arc::clone(&empty_frames_counter),
                     last_rx_at.clone(),
                 ));
@@ -229,10 +273,32 @@ pub async fn run_data_pipe(
                     "L2CAP path added to pipe"
                 );
             }
+            Some(lost) = path_died_rx.recv() => {
+                // A worker's io ended. Retire just that path: the other one, if there
+                // is one, is still carrying traffic, and the peer is only stalled once
+                // nothing is left.
+                workers.retire(lost, &device_id).await;
+                if lost == ConnectPath::L2cap {
+                    // Same eviction `forward_outbound` reports, so report it the same
+                    // way: without this the registry keeps proposing an upgrade the
+                    // peer has already shown it cannot hold.
+                    let _ = registry_tx
+                        .send(PeerCommand::L2capPathEvicted {
+                            device_id: device_id.clone(),
+                        })
+                        .await;
+                }
+                if workers.is_empty() {
+                    tracing::debug!(device = %device_id, ?lost, "last path died; pipe exiting");
+                    report_link_dead(&registry_tx, &device_id).await;
+                    break;
+                }
+                tracing::info!(device = %device_id, ?lost, "path died; pipe continuing");
+            }
         }
     }
 
-    teardown_worker_set(workers, device_id, L2CAP_HANDOVER_TIMEOUT).await;
+    teardown_worker_set(workers, &device_id).await;
 }
 
 /// Forward an outbound datagram, preferring L2CAP. On worker death
@@ -247,7 +313,7 @@ pub async fn run_data_pipe(
 /// `try_send` on GATT (no blocking) because GATT is the fallback —
 /// if GATT is also backpressured, iroh's retransmit will handle it.
 ///
-/// Emits `PeerCommand::L2capHandoverTimeout` to the registry when
+/// Emits `PeerCommand::L2capPathEvicted` to the registry when
 /// L2CAP is evicted due to a timeout, so the registry can flip its
 /// `l2cap_upgrade_failed` flag and stop proposing L2CAP for this
 /// peer for a while.
@@ -281,11 +347,9 @@ async fn forward_outbound(
                     timeout_ms = L2CAP_HANDOVER_TIMEOUT.as_millis(),
                     "L2CAP outbound wedged; evicting L2CAP path and falling back to GATT"
                 );
-                if let Some(worker) = workers.l2cap.take() {
-                    teardown_l2cap_worker(worker, device_id.clone(), L2CAP_HANDOVER_TIMEOUT).await;
-                }
+                workers.retire(ConnectPath::L2cap, device_id).await;
                 let _ = registry_tx
-                    .send(PeerCommand::L2capHandoverTimeout {
+                    .send(PeerCommand::L2capPathEvicted {
                         device_id: device_id.clone(),
                     })
                     .await;
@@ -296,9 +360,7 @@ async fn forward_outbound(
                     device = %device_id,
                     "L2CAP path closed during outbound; falling back to GATT"
                 );
-                if let Some(worker) = workers.l2cap.take() {
-                    teardown_l2cap_worker(worker, device_id.clone(), L2CAP_HANDOVER_TIMEOUT).await;
-                }
+                workers.retire(ConnectPath::L2cap, device_id).await;
                 send
             }
         }
@@ -377,17 +439,12 @@ fn forward_inbound_gatt(workers: &mut WorkerSet, bytes: Bytes, device_id: &blew:
 /// wait bounded for each to exit. Aborts any that don't meet the
 /// deadline so a wedged worker can't hold the pipe supervisor past
 /// teardown.
-async fn teardown_worker_set(workers: WorkerSet, device_id: blew::DeviceId, timeout: Duration) {
-    let WorkerSet { gatt, l2cap } = workers;
-    if let Some(w) = gatt {
-        teardown_gatt_worker(w, device_id.clone(), timeout).await;
-    }
-    if let Some(w) = l2cap {
-        teardown_l2cap_worker(w, device_id.clone(), timeout).await;
-    }
+async fn teardown_worker_set(mut workers: WorkerSet, device_id: &blew::DeviceId) {
+    workers.retire(ConnectPath::Gatt, device_id).await;
+    workers.retire(ConnectPath::L2cap, device_id).await;
 }
 
-async fn teardown_gatt_worker(w: GattWorker, device_id: blew::DeviceId, timeout: Duration) {
+async fn teardown_gatt_worker(w: GattWorker, device_id: &blew::DeviceId) {
     let GattWorker {
         outbound_fwd_tx,
         inbound_fwd_tx,
@@ -404,7 +461,10 @@ async fn teardown_gatt_worker(w: GattWorker, device_id: blew::DeviceId, timeout:
     if let Some(s) = shutdown_tx.take() {
         let _ = s.send(());
     }
-    if tokio::time::timeout(timeout, &mut handle).await.is_err() {
+    if tokio::time::timeout(L2CAP_HANDOVER_TIMEOUT, &mut handle)
+        .await
+        .is_err()
+    {
         handle.abort();
         tracing::debug!(
             device = %device_id,
@@ -413,7 +473,7 @@ async fn teardown_gatt_worker(w: GattWorker, device_id: blew::DeviceId, timeout:
     }
 }
 
-async fn teardown_l2cap_worker(w: L2capWorker, device_id: blew::DeviceId, timeout: Duration) {
+async fn teardown_l2cap_worker(w: L2capWorker, device_id: &blew::DeviceId) {
     let L2capWorker {
         outbound_fwd_tx,
         teardown_flag,
@@ -421,7 +481,10 @@ async fn teardown_l2cap_worker(w: L2capWorker, device_id: blew::DeviceId, timeou
     } = w;
     drop(outbound_fwd_tx);
     teardown_flag.store(true, Ordering::Relaxed);
-    if tokio::time::timeout(timeout, &mut handle).await.is_err() {
+    if tokio::time::timeout(L2CAP_HANDOVER_TIMEOUT, &mut handle)
+        .await
+        .is_err()
+    {
         handle.abort();
         tracing::debug!(
             device = %device_id,
@@ -437,7 +500,7 @@ fn spawn_gatt_worker(
     stable_conn_id: crate::transport::routing::StableConnId,
     role: ConnectRole,
     incoming_tx: mpsc::Sender<IncomingPacket>,
-    registry_tx: mpsc::Sender<PeerCommand>,
+    path_died_tx: mpsc::Sender<ConnectPath>,
     retransmit_counter: Arc<AtomicU64>,
     truncation_counter: Arc<AtomicU64>,
     last_rx_at: LivenessClock,
@@ -456,7 +519,7 @@ fn spawn_gatt_worker(
         shutdown_rx,
         Arc::clone(&teardown_flag),
         incoming_tx,
-        registry_tx,
+        path_died_tx,
         retransmit_counter,
         truncation_counter,
         last_rx_at,
@@ -476,7 +539,7 @@ fn spawn_l2cap_worker(
     stable_conn_id: crate::transport::routing::StableConnId,
     channel: blew::L2capChannel,
     incoming_tx: mpsc::Sender<IncomingPacket>,
-    registry_tx: mpsc::Sender<PeerCommand>,
+    path_died_tx: mpsc::Sender<ConnectPath>,
     empty_frames_counter: Arc<AtomicU64>,
     last_rx_at: LivenessClock,
 ) -> L2capWorker {
@@ -489,7 +552,7 @@ fn spawn_l2cap_worker(
         outbound_fwd_rx,
         Arc::clone(&teardown_flag),
         incoming_tx,
-        registry_tx,
+        path_died_tx,
         empty_frames_counter,
         last_rx_at,
     ));
@@ -511,7 +574,7 @@ async fn run_gatt_pipe(
     mut shutdown_rx: oneshot::Receiver<()>,
     teardown_flag: Arc<AtomicBool>,
     incoming_tx: mpsc::Sender<IncomingPacket>,
-    registry_tx: mpsc::Sender<PeerCommand>,
+    path_died_tx: mpsc::Sender<ConnectPath>,
     retransmit_counter: Arc<AtomicU64>,
     truncation_counter: Arc<AtomicU64>,
     last_rx_at: LivenessClock,
@@ -639,12 +702,8 @@ async fn run_gatt_pipe(
     }
 
     if link_dead {
-        let _ = registry_tx
-            .send(PeerCommand::Stalled {
-                device_id: device_id.clone(),
-                cause: crate::transport::peer::StallCause::LinkDead,
-            })
-            .await;
+        // The supervisor decides whether losing this path means the peer is gone.
+        let _ = path_died_tx.send(ConnectPath::Gatt).await;
     }
 }
 
@@ -656,7 +715,7 @@ async fn run_l2cap_pipe(
     mut outbound_rx: mpsc::Receiver<PendingSend>,
     teardown_flag: Arc<AtomicBool>,
     incoming_tx: mpsc::Sender<IncomingPacket>,
-    registry_tx: mpsc::Sender<PeerCommand>,
+    path_died_tx: mpsc::Sender<ConnectPath>,
     empty_frames_counter: Arc<AtomicU64>,
     last_rx_at: LivenessClock,
 ) {
@@ -739,12 +798,8 @@ async fn run_l2cap_pipe(
     }
 
     if io_died {
-        let _ = registry_tx
-            .send(PeerCommand::Stalled {
-                device_id: device_id.clone(),
-                cause: crate::transport::peer::StallCause::LinkDead,
-            })
-            .await;
+        // The supervisor decides whether losing this path means the peer is gone.
+        let _ = path_died_tx.send(ConnectPath::L2cap).await;
     }
 }
 
@@ -756,6 +811,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::task::{RawWaker, RawWakerVTable, Waker};
     use tokio::sync::Notify;
+    use tokio::time::Duration;
 
     fn noop_waker() -> Waker {
         fn no_op(_: *const ()) {}
@@ -950,10 +1006,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gatt_worker_quiesce_exits_without_stalled() {
+    async fn gatt_worker_quiesce_exits_without_reporting_a_dead_path() {
         let iface = Arc::new(MockBleInterface::new());
         let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
-        let (registry_tx, mut registry_rx) = mpsc::channel::<PeerCommand>(4);
+        let (path_died_tx, mut path_died_rx) = mpsc::channel::<ConnectPath>(4);
 
         let worker = spawn_gatt_worker(
             iface as Arc<dyn BleInterface>,
@@ -961,7 +1017,7 @@ mod tests {
             crate::transport::routing::StableConnId::for_test(99),
             ConnectRole::Central,
             incoming_tx,
-            registry_tx,
+            path_died_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             LivenessClock::new(),
@@ -982,14 +1038,14 @@ mod tests {
             .expect("gatt worker should exit promptly")
             .expect("gatt worker should not panic");
 
-        // Worker exit drops its registry_tx clone, so `Disconnected` is the
-        // expected steady state here. Either Empty or Disconnected satisfies
-        // "nothing was ever sent"; only an `Ok(...)` would indicate a leaked
-        // Stalled notification.
-        let got = registry_rx.try_recv();
+        // Worker exit drops its sender clone, so `Disconnected` is the expected
+        // steady state here. Either Empty or Disconnected satisfies "nothing was ever
+        // sent"; only an `Ok(...)` would mean an ordered shutdown was misreported as a
+        // path death, which the supervisor could then turn into a peer-level stall.
+        let got = path_died_rx.try_recv();
         assert!(
             got.is_err(),
-            "quiesce must not emit any PeerCommand; got {got:?}"
+            "quiesce must not report a dead path; got {got:?}"
         );
     }
 
@@ -1059,6 +1115,139 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn l2cap_dying_leaves_a_pipe_that_still_has_gatt_alive() {
+        // The macOS failure: an L2CAP upgrade lands, the peer resets the channel a few
+        // seconds later, and the session was carried by GATT the whole time. Losing the
+        // upgrade must not be reported as the peer being unreachable.
+        let iface = Arc::new(MockBleInterface::new());
+        let (outbound_tx, outbound_rx) = mpsc::channel::<PendingSend>(4);
+        let (_inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(4);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let (registry_tx, mut registry_rx) = mpsc::channel::<PeerCommand>(4);
+        let (swap_tx, swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
+
+        let device_id = blew::DeviceId::from("l2cap-dies-gatt-lives");
+        let _pipe = tokio::spawn(run_data_pipe(
+            Arc::clone(&iface) as Arc<dyn BleInterface>,
+            device_id.clone(),
+            crate::transport::routing::StableConnId::for_test(7),
+            ConnectRole::Central,
+            // Starts on GATT, as a real session does.
+            ConnectPath::Gatt,
+            None,
+            outbound_rx,
+            inbound_rx,
+            incoming_tx,
+            registry_tx,
+            swap_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            LivenessClock::new(),
+        ));
+
+        let (central_side, peripheral_side) = blew::L2capChannel::pair(8192);
+        swap_tx.send(central_side).await.unwrap();
+        // Let the supervisor install the L2CAP worker before killing it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The peer goes away: the worker's reader ends and it reports its path dead.
+        drop(peripheral_side);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // The eviction is reported, so the registry stops proposing an upgrade this
+        // peer cannot hold, but the peer itself must not be stalled while GATT carries
+        // it.
+        let mut saw_evicted = false;
+        while let Ok(cmd) = registry_rx.try_recv() {
+            match cmd {
+                PeerCommand::L2capPathEvicted { .. } => saw_evicted = true,
+                other => panic!(
+                    "losing L2CAP while GATT is alive must not stall the peer; got {other:?}"
+                ),
+            }
+        }
+        assert!(
+            saw_evicted,
+            "retiring the L2CAP path must be reported to the registry"
+        );
+
+        // And the surviving path still carries traffic.
+        outbound_tx
+            .send(PendingSend {
+                tx_gen: 1,
+                datagram: Bytes::from_static(b"after-l2cap-died"),
+                waker: noop_waker(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if iface
+                    .calls()
+                    .iter()
+                    .any(|c| matches!(c, CallKind::WriteC2p { .. }))
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("outbound must fall back to the surviving GATT path");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn losing_the_only_path_does_stall_the_peer() {
+        // The other half of the invariant: with nothing left to fall back to, the
+        // supervisor is the one that raises it.
+        let iface = Arc::new(MockBleInterface::new());
+        let (_outbound_tx, outbound_rx) = mpsc::channel::<PendingSend>(4);
+        let (_inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(4);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let (registry_tx, mut registry_rx) = mpsc::channel::<PeerCommand>(4);
+        let (_swap_tx, swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
+
+        let (central_side, peripheral_side) = blew::L2capChannel::pair(8192);
+        let device_id = blew::DeviceId::from("l2cap-only-path");
+        let _pipe = tokio::spawn(run_data_pipe(
+            iface as Arc<dyn BleInterface>,
+            device_id.clone(),
+            crate::transport::routing::StableConnId::for_test(8),
+            ConnectRole::Central,
+            ConnectPath::L2cap,
+            Some(central_side),
+            outbound_rx,
+            inbound_rx,
+            incoming_tx,
+            registry_tx,
+            swap_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            LivenessClock::new(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(peripheral_side);
+
+        // Retiring the only path reports the eviction first; what matters is that the
+        // peer is then stalled, because nothing is left to carry it.
+        let cause = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match registry_rx.recv().await {
+                    Some(PeerCommand::Stalled { cause, .. }) => return Some(cause),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .expect("losing the only path must be reported")
+        .expect("registry closed without a stall");
+        assert_eq!(cause, crate::transport::peer::StallCause::LinkDead);
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn l2cap_timeout_path_stops_worker_before_dropping_it() {
         let (registry_tx, mut registry_rx) = mpsc::channel::<PeerCommand>(4);
@@ -1093,10 +1282,10 @@ mod tests {
             "timed-out L2CAP worker must be evicted"
         );
         match registry_rx.recv().await.expect("timeout metric command") {
-            PeerCommand::L2capHandoverTimeout { device_id: got } => {
+            PeerCommand::L2capPathEvicted { device_id: got } => {
                 assert_eq!(got, blew::DeviceId::from("l2cap-timeout"));
             }
-            other => panic!("expected L2capHandoverTimeout, got {other:?}"),
+            other => panic!("expected L2capPathEvicted, got {other:?}"),
         }
 
         release.notify_one();

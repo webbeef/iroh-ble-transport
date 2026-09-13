@@ -204,6 +204,16 @@ impl ConnectionRegistry {
         id
     }
 
+    /// Whether an (endpoint, pipe) bucket currently holds no connections.
+    ///
+    /// Unlike [`Self::remove_and_is_empty`] this only reads, so the question can be
+    /// asked again later. A bucket is only ever present with at least one handle in
+    /// it, so absence is emptiness.
+    #[must_use]
+    pub fn is_empty_for(&self, endpoint_id: EndpointId, stable_id: StableConnId) -> bool {
+        !self.inner.lock().buckets.contains_key(&(endpoint_id, stable_id))
+    }
+
     /// Drop one watch and report whether its (endpoint, pipe) bucket is
     /// now empty — i.e. whether the last connection on that pipe is gone.
     pub fn remove_and_is_empty(
@@ -267,6 +277,36 @@ impl ConnectionRegistry {
             .filter(|handle| handle.close_if_only_path(pipe, code, reason))
             .count()
     }
+}
+
+/// How long a pipe with no iroh connections on it is kept before being torn down.
+///
+/// An application that closes one connection and immediately opens another to the same
+/// peer would otherwise destroy the pipe in the gap, and over BLE that is expensive to
+/// rebuild: it means reconnecting to a peer which, having just been connected to, has
+/// stopped advertising.
+///
+/// A linger rather than a cooldown: the pipe stays usable throughout, so the follow-up
+/// connection is served at once rather than waiting this out. The only thing deferred
+/// is the teardown, which is why it can afford to be generous -- long enough to outlast
+/// a QUIC handshake over a GATT pipe, chunked to the ATT MTU and so much slower than
+/// the same handshake on a socket.
+///
+/// Chosen against iroh's own answer to the same question: it keeps a remote's state for
+/// 60s past its last connection, for the same reason. This deliberately undercuts that,
+/// because here the resource being held open is a radio link on a phone.
+pub const PIPE_LINGER: Duration = Duration::from_secs(10);
+
+/// Wait out [`PIPE_LINGER`], then report whether the pipe is still idle.
+///
+/// `false` means a connection arrived while we waited and the pipe must be left alone.
+pub(crate) async fn linger_then_confirm_idle(
+    connections: &ConnectionRegistry,
+    endpoint_id: EndpointId,
+    stable_id: StableConnId,
+) -> bool {
+    tokio::time::sleep(PIPE_LINGER).await;
+    connections.is_empty_for(endpoint_id, stable_id)
 }
 
 /// Close every iroh connection riding a pipe the dedup rule just
@@ -352,6 +392,43 @@ mod tests {
 
     fn endpoint(seed: u8) -> EndpointId {
         iroh_base::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    /// Empties a pipe's bucket, then re-registers on it after `arrives_after`.
+    /// Returns whether the pipe would be torn down.
+    async fn reclaimed_after(arrives_after: Duration) -> bool {
+        let registry = Arc::new(ConnectionRegistry::default());
+        let pipe = StableConnId::for_test(1);
+        let ep = endpoint(1);
+        let first = registry.insert(ep, pipe, FakeConn::new());
+        assert!(registry.remove_and_is_empty(ep, pipe, first));
+
+        let reclaimer = Arc::clone(&registry);
+        tokio::spawn(async move {
+            tokio::time::sleep(arrives_after).await;
+            // The bucket owns the handle, so the watch id can be dropped.
+            let _watch = reclaimer.insert(ep, pipe, FakeConn::new());
+        });
+
+        linger_then_confirm_idle(&registry, ep, pipe).await
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_connection_arriving_during_the_linger_saves_the_pipe() {
+        // The gap this exists for: see `PIPE_LINGER`. Also fails if the wait is ever
+        // removed, since the re-check would then run before the arrival.
+        assert!(
+            !reclaimed_after(PIPE_LINGER / 5).await,
+            "the pipe is carrying a connection again and must be left alone"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_connection_arriving_after_the_linger_is_too_late() {
+        assert!(
+            reclaimed_after(PIPE_LINGER * 2).await,
+            "nothing reclaimed the pipe in time, so it must be torn down"
+        );
     }
 
     #[test]
@@ -538,6 +615,10 @@ mod tests {
             registry.remove_and_is_empty(endpoint_id, stable_id, second),
             "last close reports the peer/stable-id bucket empty"
         );
+        assert!(
+            registry.is_empty_for(endpoint_id, stable_id),
+            "and re-asking gives the same answer"
+        );
     }
 
     #[test]
@@ -554,5 +635,9 @@ mod tests {
             registry.remove_and_is_empty(endpoint_id, old_id, old_watch),
             "old stable-id bucket is empty even if replacement stable-id has an active connection"
         );
+        // Keyed by (endpoint, pipe): a second pipe to the same peer must not make the
+        // first one look busy, or a linger would never expire it.
+        assert!(registry.is_empty_for(endpoint_id, old_id));
+        assert!(!registry.is_empty_for(endpoint_id, new_id));
     }
 }
