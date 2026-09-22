@@ -663,7 +663,24 @@ impl<I: BleInterface> Driver<I> {
                         );
                         (reservation.stable_id, Some(reservation.endpoint_id))
                     }
-                    None => (routing.register_pipe(device_id.clone(), direction), None),
+                    None => {
+                        // The acceptor has nothing reserved: it learns of the peer from
+                        // an inbound write, not from a dial it made. Logged all the same
+                        // -- without it a pipe built on this side is invisible, and a
+                        // second one for the same device (a restart stranding the
+                        // dialer's handshake) cannot be told from the first.
+                        let stable_id = routing.register_pipe(device_id.clone(), direction);
+                        tracing::info!(
+                            device = %device_id,
+                            %stable_id,
+                            ?role,
+                            ?path,
+                            tx_gen,
+                            lifecycle_id,
+                            "StartDataPipe: new pipe, no reservation"
+                        );
+                        (stable_id, None)
+                    }
                 };
                 routing.register_pending(stable_id, reservation_endpoint);
                 tokio::spawn(async move {
@@ -1012,8 +1029,10 @@ impl BleInterface for BlewDriver {
         }
         let read = self.read_identity_value(device_id, linked).await;
         if !linked {
-            // Released on the error path too: this is a drive-by read, not a session,
-            // and an open link would block the transport's own connect to this peer.
+            // Released whether or not the read worked: this is a drive-by read, not a
+            // session, and an open link would block the transport's own connect to this
+            // peer. A failed `connect` returns above instead, having established
+            // nothing to release; blew's own timeout path disconnects.
             if let Err(e) = self.central.disconnect(device_id).await {
                 tracing::debug!(device = %device_id, ?e, "identity read: disconnect failed");
             }
@@ -1065,11 +1084,16 @@ impl BleInterface for BlewDriver {
     }
 
     async fn rebuild_server(&self) -> crate::error::BleResult<()> {
-        // Best-effort: adapter-cycle typically wipes the platform's service
-        // table on Android, so re-adding is required; on macOS/iOS this is
-        // often a no-op because CoreBluetooth restores state for us.
+        // Best-effort: an adapter cycle typically wipes the platform's service table on
+        // Android, so re-adding is required.
         if let Err(e) = self.peripheral.stop_advertising().await {
             tracing::debug!(?e, "rebuild_server: stop_advertising ignored");
+        }
+        // Clear before re-adding. CoreBluetooth keeps its service table across the
+        // cycle, so without this every characteristic is registered a second time; the
+        // other backends start empty and this is a no-op for them.
+        if let Err(e) = self.peripheral.remove_all_services().await {
+            tracing::debug!(?e, "rebuild_server: remove_all_services ignored");
         }
         for service in &self.services {
             if let Err(e) = self.peripheral.add_service(service).await {

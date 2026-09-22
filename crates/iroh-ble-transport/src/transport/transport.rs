@@ -367,6 +367,8 @@ pub struct BleTransport {
     inbox_capacity_wakers: Arc<Mutex<Vec<Waker>>>,
     store: Arc<dyn PeerStore>,
     adapter_state_rx: tokio::sync::watch::Receiver<BleAdapterState>,
+    /// Taken by the first [`BleTransport::shutdown`], so a second call is a no-op.
+    teardown: tokio::sync::Mutex<Option<Teardown>>,
     /// Kept so `read_identity` can issue a one-off GATT read.
     ///
     /// This bypasses the driver's per-device lane, which serialises connect,
@@ -517,7 +519,70 @@ impl ConstructRollback {
     }
 }
 
+/// Everything construction registered with the platform, and the tasks that service it.
+///
+/// Dropping a `BleTransport` does not release any of this: the advertisement, the scan,
+/// the GATT service table and the L2CAP listener live in the OS stack, and on
+/// CoreBluetooth the service table survives `stop_advertising` outright. A caller that
+/// tears the transport down and builds another -- to change the advertised name, say --
+/// would otherwise leave the old GATT server and listener registered beside the new
+/// ones, and a peer that reads the stale PSM dials a listener whose endpoint is gone.
+struct Teardown {
+    central: Arc<Central>,
+    peripheral: Arc<Peripheral>,
+    /// The actor, the hook forwarder, the event pumps, the watchdog, and the L2CAP
+    /// accept loop if one started.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Teardown {
+    async fn run(self) {
+        // Tasks first: aborting is instant and is what actually stops new work, where
+        // the platform calls are requests. Ordering it after them left the watchdog
+        // ticking and the registry free to start a connect for as long as the slowest
+        // one took -- up to two seconds on Apple, whose `stop_advertising` polls until
+        // the stack settles.
+        for task in self.tasks {
+            task.abort();
+        }
+        if let Err(e) = self.central.stop_scan().await {
+            warn!(error = %e, "shutdown: stop_scan failed");
+        }
+        // Explicit, because aborting our accept loop does not do it: the listening
+        // socket is owned below us (an internal accept task on Linux, the peripheral
+        // manager on Apple), so dropping the stream leaves the PSM bound and
+        // connectable -- the stale listener this teardown exists to prevent.
+        if let Err(e) = self.peripheral.close_l2cap_listener().await {
+            warn!(error = %e, "shutdown: close_l2cap_listener failed");
+        }
+        if let Err(e) = self.peripheral.remove_all_services().await {
+            warn!(error = %e, "shutdown: remove_all_services failed");
+        }
+        // Last, because it is the slow one and nothing above depends on it.
+        if let Err(e) = self.peripheral.stop_advertising().await {
+            warn!(error = %e, "shutdown: stop_advertising failed");
+        }
+    }
+}
+
 impl BleTransport {
+    /// Give back what construction registered: the tasks, the scan, the advertisement,
+    /// the L2CAP listener and the GATT service table. See [`Teardown`].
+    ///
+    /// Not a full stop. The `Central` and `Peripheral` sessions stay open, and live LE
+    /// links are left to the peer or the OS to drop -- so call this once the endpoint
+    /// using the transport has closed, with nothing left to drain.
+    ///
+    /// Idempotent, and cannot fail: a radio that has already gone away is not worth
+    /// reporting to a caller who is shutting down anyway. Failures are logged.
+    pub async fn shutdown(&self) {
+        let Some(teardown) = self.teardown.lock().await.take() else {
+            return;
+        };
+        info!("BLE transport shutting down");
+        teardown.run().await;
+    }
+
     /// Start configuring a new transport. See [`BleTransportBuilder`].
     #[must_use]
     pub fn builder() -> BleTransportBuilder {
@@ -672,12 +737,15 @@ impl BleTransport {
         // `wait_ready` above only returns once both roles report powered.
         let (adapter_state_tx, adapter_state_rx) =
             tokio::sync::watch::channel(BleAdapterState::PoweredOn);
+        // Held so `shutdown` can stop them; see `Teardown`.
+        let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
         let registry =
             Registry::new(l2cap_policy, local_id).with_adapter_state_tx(adapter_state_tx);
         let snap_for_actor = Arc::clone(&snapshots);
         let wakers_for_actor = Arc::clone(&inbox_capacity_wakers);
         let routing_for_actor = Arc::clone(&routing);
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             registry
                 .run(
                     inbox_rx,
@@ -687,7 +755,7 @@ impl BleTransport {
                     routing_for_actor,
                 )
                 .await;
-        });
+        }));
 
         // Hook channel: the hook returned from `BleTransport::dedup_hook`
         // sends verified-endpoint and last-connection-closed events here;
@@ -695,7 +763,7 @@ impl BleTransport {
         let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel::<HookEvent>();
         let forwarder_inbox = inbox_tx.clone();
         let forwarder_routing = Arc::clone(&routing);
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             while let Some(event) = hook_rx.recv().await {
                 if handle_hook_event(&forwarder_inbox, &forwarder_routing, event)
                     .await
@@ -704,24 +772,27 @@ impl BleTransport {
                     break;
                 }
             }
-        });
+        }));
 
-        tokio::spawn(run_central_events(
+        tasks.push(tokio::spawn(run_central_events(
             Arc::clone(&central),
             Arc::clone(&routing),
             inbox_tx.clone(),
-        ));
-        tokio::spawn(run_peripheral_state_events(
+        )));
+        tasks.push(tokio::spawn(run_peripheral_state_events(
             Arc::clone(&peripheral),
             Arc::clone(&routing),
             inbox_tx.clone(),
-        ));
-        tokio::spawn(run_peripheral_requests(
+        )));
+        tasks.push(tokio::spawn(run_peripheral_requests(
             Arc::clone(&peripheral),
             inbox_tx.clone(),
             psm_atomic,
-        ));
-        tokio::spawn(run_watchdog(inbox_tx.clone()));
+        )));
+        tasks.push(tokio::spawn(run_watchdog(inbox_tx.clone())));
+        if let Some(accept) = rollback.l2cap_accept.take() {
+            tasks.push(accept);
+        }
 
         Ok(Arc::new(Self {
             local_id,
@@ -742,6 +813,11 @@ impl BleTransport {
             inbox_capacity_wakers,
             store,
             adapter_state_rx,
+            teardown: tokio::sync::Mutex::new(Some(Teardown {
+                central,
+                peripheral,
+                tasks,
+            })),
         }))
     }
 
